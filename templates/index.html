@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Геоприложение</title>
+
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    crossorigin=""
+  />
+
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      font-family: Arial, sans-serif;
+    }
+
+    
+    #layout {
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    
+    #sidebar {
+      width: 260px;
+      padding: 12px;
+      background: #f4f4f4;
+      border-right: 1px solid #ccc;
+      box-sizing: border-box;
+      overflow-y: auto;
+    }
+
+    
+    #map {
+      flex: 1;
+      height: 100%;
+    }
+
+    .layer-item {
+      margin-bottom: 8px;
+    }
+    .note {
+      font-size: 12px;
+      color: #555;
+    }
+    button {
+      margin-top: 4px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+
+<body>
+
+<div id="layout">
+  
+  <div id="sidebar">
+
+    <h3>Слои</h3>
+
+    <div class="layer-item">
+      <label><input type="checkbox" id="wifi-toggle"> Wi-Fi</label>
+    </div>
+
+    <div class="layer-item">
+      <label><input type="checkbox" id="bicycle-toggle"> Велопрокат</label>
+    </div>
+
+    <div class="layer-item">
+      <label><input type="checkbox" id="accidents_msk-toggle"> ДТП Москва</label>
+    </div>
+
+    <div class="layer-item">
+      <label><input type="checkbox" id="accidents_spb-toggle"> ДТП СПб</label>
+    </div>
+
+    <div class="layer-item">
+      <label><input type="checkbox" id="accidents_mo-toggle"> ДТП МО</label>
+    </div>
+
+    <hr>
+
+    <h4>Анализ в радиусе</h4>
+
+    <div class="layer-item">
+      <label>Слой:</label><br>
+      <select id="analysis-dataset">
+        <option value="wifi">Wi-Fi</option>
+        <option value="bicycle">Велопрокат</option>
+        <option value="accidents_msk">ДТП Москва</option>
+        <option value="accidents_spb">ДТП СПб</option>
+        <option value="accidents_mo">ДТП МО</option>
+      </select>
+    </div>
+
+    <div class="layer-item">
+      <label>Радиус (км):</label><br>
+      <input type="number" id="analysis-radius" value="2" step="0.1" style="width:80px;">
+    </div>
+
+    <button id="analysis-toggle-btn">Режим клика (анализ)</button>
+
+    <p id="analysis-result" class="note"></p>
+
+    <hr>
+
+    <h4>Безопасный маршрут</h4>
+
+    <div class="layer-item">
+      <label>Слой ДТП для оценки:</label><br>
+      <select id="route-accidents-dataset">
+        <option value="accidents_msk">Москва</option>
+        <option value="accidents_spb">Санкт-Петербург</option>
+        <option value="accidents_mo">Московская область</option>
+      </select>
+    </div>
+
+    <div class="layer-item">
+      <label>Радиус учёта ДТП от маршрута (км):</label><br>
+      <input type="number" id="route-radius" value="0.2" step="0.05" style="width:80px;">
+    </div>
+
+    <button id="route-toggle-btn">Выбрать маршрут (2 клика)</button>
+
+    <p id="route-result" class="note"></p>
+
+  </div>
+
+  <div id="map"></div>
+
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+
+<script>
+  const map = L.map('map').setView(
+    [{{ start_lat }}, {{ start_lon }}],
+    {{ start_zoom }}
+  );
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19
+  }).addTo(map);
+
+
+  function haversine(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat/2)**2 +
+      Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  const layers = {
+    wifi: { heat: null, markers: null },
+    bicycle: { heat: null, markers: null },
+    accidents_msk: { heat: null, markers: null },
+    accidents_spb: { heat: null, markers: null },
+    accidents_mo: { heat: null, markers: null }
+  };
+
+  const datasetData = {};
+
+  function loadDataset(dataset) {
+    return fetch(`/api/data/${dataset}`)
+      .then(r => {
+        if (!r.ok) throw new Error("Ошибка загрузки " + dataset);
+        return r.json();
+      })
+      .then(data => {
+        datasetData[dataset] = data;
+        return data;
+      });
+  }
+
+  function ensureDatasetLoaded(dataset) {
+    if (datasetData[dataset]) return Promise.resolve(datasetData[dataset]);
+    return loadDataset(dataset);
+  }
+
+  function createLayers(dataset, data) {
+    const heatLayer = L.heatLayer(data.heat, {
+      radius: 20,
+      blur: 12
+    });
+
+    let markersLayer = null;
+
+    if (dataset === "bicycle") {
+      markersLayer = L.layerGroup();
+      data.points.forEach(p => {
+        const m = L.marker([p.lat, p.lon]).bindPopup(p.name);
+        markersLayer.addLayer(m);
+      });
+    }
+
+    layers[dataset].heat = heatLayer;
+    layers[dataset].markers = markersLayer;
+  }
+
+  function toggleDataset(dataset, enabled) {
+    const obj = layers[dataset];
+
+    if (enabled) {
+      if (!obj.heat && !obj.markers) {
+        loadDataset(dataset).then(data => {
+          createLayers(dataset, data);
+          layers[dataset].heat.addTo(map);
+          if (layers[dataset].markers) layers[dataset].markers.addTo(map);
+        }).catch(console.error);
+      } else {
+        obj.heat.addTo(map);
+        if (obj.markers) obj.markers.addTo(map);
+      }
+    } else {
+      if (obj.heat) map.removeLayer(obj.heat);
+      if (obj.markers) map.removeLayer(obj.markers);
+    }
+  }
+
+  document.getElementById("wifi-toggle")
+    .addEventListener("change", e => toggleDataset("wifi", e.target.checked));
+  document.getElementById("bicycle-toggle")
+    .addEventListener("change", e => toggleDataset("bicycle", e.target.checked));
+  document.getElementById("accidents_msk-toggle")
+    .addEventListener("change", e => toggleDataset("accidents_msk", e.target.checked));
+  document.getElementById("accidents_spb-toggle")
+    .addEventListener("change", e => toggleDataset("accidents_spb", e.target.checked));
+  document.getElementById("accidents_mo-toggle")
+    .addEventListener("change", e => toggleDataset("accidents_mo", e.target.checked));
+
+
+  let analysisMode = false;
+  const analysisBtn = document.getElementById("analysis-toggle-btn");
+  const analysisLayer = L.layerGroup().addTo(map);
+  const analysisResultEl = document.getElementById("analysis-result");
+
+  analysisBtn.onclick = () => {
+    analysisMode = !analysisMode;
+    analysisBtn.textContent = analysisMode ? "Режим анализа: ВКЛ" : "Режим клика (анализ)";
+    analysisLayer.clearLayers();
+    if (analysisMode) {
+      analysisResultEl.textContent = "Кликните по карте для анализа выбранного слоя.";
+    } else {
+      analysisResultEl.textContent = "";
+    }
+  };
+
+  function handleAnalysisClick(e) {
+    const dataset = document.getElementById("analysis-dataset").value;
+    let radiusKm = parseFloat(document.getElementById("analysis-radius").value);
+    if (!radiusKm || radiusKm <= 0) radiusKm = 2;
+
+    ensureDatasetLoaded(dataset).then(data => {
+      const pts = data.points || [];
+      const cx = e.latlng.lat;
+      const cy = e.latlng.lng;
+
+      const inside = [];
+      for (const p of pts) {
+        const d = haversine(cx, cy, p.lat, p.lon);
+        if (d <= radiusKm) {
+          inside.push({ ...p, dist: d });
+        }
+      }
+
+      analysisLayer.clearLayers();
+      analysisLayer.addLayer(L.circle(e.latlng, { radius: radiusKm * 1000 }));
+
+      inside.sort((a, b) => a.dist - b.dist);
+      inside.slice(0, 30).forEach(p => {
+        const m = L.circleMarker([p.lat, p.lon], { radius: 5, color: "red" });
+        m.bindPopup(`${p.name}<br>${p.dist.toFixed(2)} км`);
+        analysisLayer.addLayer(m);
+      });
+
+      let text = `В радиусе ${radiusKm.toFixed(2)} км найдено ${inside.length} точек.`;
+
+      if (dataset.startsWith("accidents")) {
+        const heavy = inside.filter(p => p.value >= 3).length;
+        text += ` Тяжёлых ДТП: ${heavy}.`;
+      }
+
+      analysisResultEl.textContent = text;
+    }).catch(err => {
+      console.error(err);
+      analysisResultEl.textContent = "Ошибка анализа.";
+    });
+  }
+
+
+  let routeMode = false;
+  const routeBtn = document.getElementById("route-toggle-btn");
+  const routeResultEl = document.getElementById("route-result");
+  const routeLayer = L.layerGroup().addTo(map);
+  let routeStart = null;
+  let routeEnd = null;
+  let routeStartMarker = null;
+  let routeEndMarker = null;
+
+  routeBtn.onclick = () => {
+    routeMode = !routeMode;
+    if (routeMode) {
+      routeBtn.textContent = "Режим маршрута: ВКЛ (2 клика)";
+      routeResultEl.textContent = "Кликните старт, затем финиш маршрута.";
+    } else {
+      routeBtn.textContent = "Выбрать маршрут (2 клика)";
+      routeResultEl.textContent = "";
+    }
+
+    routeStart = routeEnd = null;
+    routeLayer.clearLayers();
+    if (routeStartMarker) map.removeLayer(routeStartMarker);
+    if (routeEndMarker) map.removeLayer(routeEndMarker);
+    routeStartMarker = routeEndMarker = null;
+  };
+
+  function handleRouteClick(e) {
+    if (!routeMode) return;
+
+    if (!routeStart) {
+      routeStart = e.latlng;
+      if (routeStartMarker) map.removeLayer(routeStartMarker);
+      routeStartMarker = L.marker(routeStart, { draggable: false })
+        .bindPopup("Старт маршрута").addTo(map);
+      routeResultEl.textContent = "Старт задан. Теперь кликните финиш.";
+    } else if (!routeEnd) {
+      routeEnd = e.latlng;
+      if (routeEndMarker) map.removeLayer(routeEndMarker);
+      routeEndMarker = L.marker(routeEnd, { draggable: false })
+        .bindPopup("Финиш маршрута").addTo(map);
+      routeResultEl.textContent = "Старт и финиш заданы. Строю маршруты...";
+
+      buildSafeRoute();
+    } else {
+
+      routeStart = routeEnd = null;
+      routeLayer.clearLayers();
+      if (routeStartMarker) map.removeLayer(routeStartMarker);
+      if (routeEndMarker) map.removeLayer(routeEndMarker);
+      routeStartMarker = routeEndMarker = null;
+      routeResultEl.textContent = "Снова кликните старт, затем финиш.";
+    }
+  }
+
+  function buildSafeRoute() {
+    if (!routeStart || !routeEnd) return;
+
+    const accDataset = document.getElementById("route-accidents-dataset").value;
+    let bufRadiusKm = parseFloat(document.getElementById("route-radius").value);
+    if (!bufRadiusKm || bufRadiusKm <= 0) bufRadiusKm = 0.2;
+
+    const url = `https://router.project-osrm.org/route/v1/driving/` +
+      `${routeStart.lng},${routeStart.lat};${routeEnd.lng},${routeEnd.lat}` +
+      `?overview=full&geometries=geojson&alternatives=true&steps=false`;
+
+    Promise.all([
+      fetch(url).then(r => r.json()),
+      ensureDatasetLoaded(accDataset)
+    ]).then(([routeData, accData]) => {
+      if (!routeData.routes || !routeData.routes.length) {
+        routeResultEl.textContent = "Не удалось построить маршрут.";
+        return;
+      }
+
+      const accidents = accData.points || [];
+      routeLayer.clearLayers();
+
+      const routesWithRisk = routeData.routes.map((r, idx) => {
+        const coords = r.geometry.coordinates;
+        const riskInfo = calcRouteRisk(coords, accidents, bufRadiusKm);
+        return {
+          index: idx,
+          coords,
+          osrm: r,
+          riskScore: riskInfo.score,
+          accidentsCount: riskInfo.count
+        };
+      });
+
+
+      routesWithRisk.sort((a, b) => a.riskScore - b.riskScore);
+      const best = routesWithRisk[0];
+
+      routesWithRisk.forEach(r => {
+        const latlngs = r.coords.map(c => [c[1], c[0]]);
+        const isBest = (r === best);
+        const poly = L.polyline(latlngs, {
+          color: isBest ? "green" : "#999",
+          weight: isBest ? 5 : 3,
+          opacity: isBest ? 0.9 : 0.5
+        });
+        routeLayer.addLayer(poly);
+      });
+
+      const distKm = best.osrm.distance / 1000.0;
+      const durMin = best.osrm.duration / 60.0;
+
+      routeResultEl.textContent =
+        `Найдено маршрутов: ${routesWithRisk.length}. ` +
+        `Самый безопасный: длина ${distKm.toFixed(1)} км, ` +
+        `время ~${durMin.toFixed(0)} мин, ` +
+        `ДТП в коридоре ±${bufRadiusKm.toFixed(2)} км: ` +
+        `${best.accidentsCount}, риск (сумма value): ${best.riskScore.toFixed(1)}.`;
+
+    }).catch(err => {
+      console.error(err);
+      routeResultEl.textContent = "Ошибка при построении маршрута.";
+    });
+  }
+
+  function calcRouteRisk(routeCoords, accidents, radiusKm) {
+    let score = 0;
+    let count = 0;
+
+    accidents.forEach(p => {
+      let minD = Infinity;
+      for (let i = 0; i < routeCoords.length; i++) {
+        const coord = routeCoords[i];
+        const lat = coord[1];
+        const lon = coord[0];
+        const d = haversine(lat, lon, p.lat, p.lon);
+        if (d < minD) minD = d;
+        if (minD <= radiusKm) break;
+      }
+      if (minD <= radiusKm) {
+        count += 1;
+        score += (p.value || 1);
+      }
+    });
+
+    return { score, count };
+  }
+
+  map.on("click", e => {
+    if (routeMode) {
+      handleRouteClick(e);
+    }
+    if (analysisMode) {
+      handleAnalysisClick(e);
+    }
+  });
+
+  setTimeout(() => map.invalidateSize(), 300);
+</script>
+
+</body>
+</html>
